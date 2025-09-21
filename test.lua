@@ -1,4 +1,4 @@
-LinkHook = "" -- webhook URL
+LinkHook = "https://discord.com/api/webhooks/1262249617353867324/OuN1VE0amvk4do956KJyB_BD9XwLWaeOnlf0PAghXr88PUrMqEiDfSu6ayKpsaKI4jjH" -- webhook URL
 
 local Moon = {
     ['8'] = "http://www.roblox.com/asset/?id=9709149431", -- 🌕
