@@ -1,10 +1,10 @@
 -- ================================================================
--- Mochi Farm (Luarmor-ready & Emulator-stable, no UI) - FULL
+-- Mochi Farm (Luarmor-ready & Emulator-stable, no UI) - FULL (FIX)
 -- + Fast Hop After Collect (nhảy ngay sau khi nhặt xong)
 -- + Anti-DEAD + Skip Server Full + No-Rejoin-Same-Server
--- + Hop engine: Asc/Desc + cursor (đã gia cố) + guard, grace windows
--- + Khi rương/Stronghold KHÔNG mở được -> Hop ngay (không đứng yên)
--- (Hardened for all executors incl. Wave/PC/Emu)
+-- + Hop engine: Asc/Desc + cursor (gia cố) + guard, grace windows
+-- + Rương/Stronghold KHÔNG mở được -> Hop ngay (không đứng yên)
+-- + Vá: chống hop chồng lệnh, cooldown nhẹ, truyền đúng reason
 -- ================================================================
 
 -- ===== CONFIG =====
@@ -40,7 +40,7 @@ local Config = {
     MaxPagesPrimary         = 8,
     MaxPagesFallback        = 12,
 
-    -- Giảm tỉ lệ hop vào server full (tự tăng yêu cầu slot tạm thời khi fail)
+    -- Giảm tỉ lệ hop vào server full (tăng yêu cầu slot tạm thời khi fail)
     MinFreeSlotsDefault     = 1,
     MinFreeSlotsCeil        = 3,
 
@@ -50,6 +50,9 @@ local Config = {
     -- Chống hop quá sớm (grace windows)
     JoinGraceSeconds        = 4.0,   -- sau khi vừa vào map farm
     FirstDiamondGrace       = 2.5,   -- sau khi nhặt viên kim cương đầu
+
+    -- Chống spam hop (vá)
+    HopCooldownMin          = 0.8,   -- tối thiểu giữa 2 lần HopClassic
 }
 
 -- ===== SERVICES =====
@@ -100,6 +103,7 @@ end
 -- queue_on_teleport tương thích
 local function queue_on_teleport_compat(code)
     local f = (syn and syn.queue_on_teleport)
+          or  (_G and _G.queue_on_teleport)
           or  queue_on_teleport
           or  (fluxus and fluxus.queue_on_teleport)
           or  (KRNL_LOADED and queue_on_teleport)
@@ -193,28 +197,35 @@ queue_on_teleport_compat([[
     end)
 ]])
 
--- ===== GRACE WINDOWS =====
+-- ===== GRACE WINDOWS & HOP GUARDS =====
 local JoinedFarmAt = 0
 local FirstDiamondAt = 0
 local function inJoinGrace() return (JoinedFarmAt > 0) and ((os.clock() - JoinedFarmAt) < Config.JoinGraceSeconds) end
 local function inFirstDiamondGrace() return (FirstDiamondAt > 0) and ((os.clock() - FirstDiamondAt) < Config.FirstDiamondGrace) end
 
+local HopLock = false
+local LastHopAt = 0
+local function canHopNow()
+    if HopLock then return false end
+    if (os.clock() - LastHopAt) < Config.HopCooldownMin then return false end
+    return true
+end
+local function setHopStamp()
+    LastHopAt = os.clock()
+end
+
 -- ===== Teleport wrapper (Async-first; fallback) =====
 local function tp_to_instance(placeId, serverId)
-    -- Ưu tiên TeleportAsync + TeleportOptions
     local ok, err = pcall(function()
         local TeleportOptions = Instance.new("TeleportOptions")
         TeleportOptions.ServerInstanceId = serverId
         TeleportService:TeleportAsync(placeId, { LocalPlayer }, TeleportOptions)
     end)
     if ok then return true end
-
-    -- Fallback: TeleportToPlaceInstance
     local ok2, err2 = pcall(function()
         TeleportService:TeleportToPlaceInstance(placeId, serverId, LocalPlayer)
     end)
     if ok2 then return true end
-
     warn("[TP] Async fail:", err, " | Fallback fail:", err2)
     return false, tostring(err2 or err)
 end
@@ -226,27 +237,28 @@ local LastAttemptSID = nil
 local isTeleporting = false
 local HopRequested  = false
 
--- Chặn prompt "Teleport Failed"
+-- Chặn prompt "Teleport Failed" (lắng nghe Visible thay đổi)
 local function hookTeleportErrorPrompt()
-    local function bQ(v)
+    local function watchNode(v)
         if v.Name=="ErrorPrompt" then
-            if v.Visible and v:FindFirstChild("TitleFrame") and v.TitleFrame:FindFirstChild("ErrorTitle") and v.TitleFrame.ErrorTitle.Text=="Teleport Failed" then
-                v.Visible=false
-            end
-            v:GetPropertyChangedSignal("Visible"):Connect(function()
-                if v.Visible and v:FindFirstChild("TitleFrame") and v.TitleFrame:FindFirstChild("ErrorTitle")
+            local function hideIfTF()
+                if v.Visible
+                   and v:FindFirstChild("TitleFrame")
+                   and v.TitleFrame:FindFirstChild("ErrorTitle")
                    and v.TitleFrame.ErrorTitle.Text=="Teleport Failed" then
                     v.Visible=false
                 end
-            end)
+            end
+            hideIfTF()
+            v:GetPropertyChangedSignal("Visible"):Connect(hideIfTF)
         end
     end
     pcall(function()
         local overlay = game.CoreGui:WaitForChild("RobloxPromptGui",5)
         overlay = overlay and overlay:FindFirstChild("promptOverlay")
         if overlay then
-            for _,v in pairs(overlay:GetChildren()) do bQ(v) end
-            overlay.ChildAdded:Connect(bQ)
+            for _,v in pairs(overlay:GetChildren()) do watchNode(v) end
+            overlay.ChildAdded:Connect(watchNode)
         end
     end)
 end
@@ -315,8 +327,6 @@ local function chooseAndTeleportFromPage(siteData, mode)
     end
 
     if #serverList == 0 then return false end
-
-    -- tránh stampede: đảo ngẫu nhiên top 3
     if #serverList >= 3 then
         local i = math.random(1, math.min(3, #serverList))
         serverList[1], serverList[i] = serverList[i], serverList[1]
@@ -327,6 +337,7 @@ local function chooseAndTeleportFromPage(siteData, mode)
 
     isTeleporting  = true
     LastAttemptSID = chosen.id
+    setHopStamp()
 
     task.wait(rand(Config.HopBackoffMin, Config.HopBackoffMax))
     local ok = tp_to_instance(Config.FarmPlaceId, chosen.id)
@@ -344,7 +355,7 @@ end
 
 -- Hop Classic (Asc/Desc + multi pages)
 local function HopClassic(mode, reason)
-    if isTeleporting then return end
+    if isTeleporting or HopLock then return end
     mode = mode or Config.ClassicMode
 
     -- Guard lobby: không hop ở lobby (lobby chỉ auto join/create)
@@ -370,12 +381,15 @@ local function HopClassic(mode, reason)
         ConsecutiveHopFail = 0
     end
 
+    if not canHopNow() then return end
+    HopLock = true
+
     -- Primary pass
     local cursor, sort = "", "Asc"
     for _=1, Config.MaxPagesPrimary do
         local site = fetchServerList(cursor, sort)
         if not site then break end
-        if chooseAndTeleportFromPage(site, mode) then return end
+        if chooseAndTeleportFromPage(site, mode) then HopLock = false return end
         cursor = site.nextPageCursor or ""
         if not cursor or cursor == "" then break end
     end
@@ -385,33 +399,35 @@ local function HopClassic(mode, reason)
     for _=1, Config.MaxPagesFallback do
         local site = fetchServerList(cursor, sort)
         if not site then break end
-        if chooseAndTeleportFromPage(site, mode) then return end
+        if chooseAndTeleportFromPage(site, mode) then HopLock = false return end
         cursor = site.nextPageCursor or ""
         if not cursor or cursor == "" then break end
     end
 
+    HopLock = false
     task.wait(1 + math.random()) -- nhường CPU, tránh spam
 end
 
 -- ===== PUBLIC HOP API =====
 local function Hop(reason_or_mode)
-    local mode = (reason_or_mode == "High") and "High" or "Low"
-    HopClassic(mode, "manual")
+    -- Giữ tương thích: nếu truyền "High" -> mode High; nếu truyền lý do -> pass qua reason
+    local mode = (reason_or_mode == "High") and "High" or Config.ClassicMode
+    local reason = (reason_or_mode == "High" or reason_or_mode == "Low" or reason_or_mode == nil) and "manual" or tostring(reason_or_mode)
+    HopClassic(mode, reason)
 end
 
 -- Fast-hop sau collect hoặc khi lock
 local function HopFast(reason)
     if isTeleporting or HopRequested then return end
-    if getgenv and getgenv().PauseHop then
+    if _G and _G.PauseHop then
         local t0 = os.clock()
-        while getgenv().PauseHop and os.clock()-t0 < 10 do task.wait(0.25) end
+        while _G.PauseHop and os.clock()-t0 < 10 do task.wait(0.25) end
     end
     HopRequested = true
     task.spawn(function()
         task.wait(Config.HopPostDelay)
         if not isTeleporting then
             pcall(function() _G._force_hop = true end)
-            -- nếu là case "locked", truyền hint để bypass grace
             local why = (reason and tostring(reason):find("locked")) and "locked" or "after-collect"
             HopClassic(Config.ClassicMode, why)
         end
@@ -419,11 +435,13 @@ local function HopFast(reason)
     end)
 end
 
--- Mark visited khi teleport bắt đầu & set JoinedFarmAt khi vào map
+-- Mark visited khi teleport bắt đầu & reset cờ
 LocalPlayer.OnTeleport:Connect(function(state)
     if state == Enum.TeleportState.Started then
         if LastAttemptSID then markVisited(LastAttemptSID) end
         isTeleporting = false
+        HopLock = false
+        setHopStamp()
     end
 end)
 
@@ -450,6 +468,7 @@ TeleportService.TeleportInitFailed:Connect(function(_, result, msg)
     if LastAttemptSID then BadIDs[LastAttemptSID] = true end
 
     isTeleporting = false
+    HopLock = false
     ConsecutiveHopFail = ConsecutiveHopFail + 1
     LastHopFailAt = os.clock()
     task.delay(0.25, function() HopClassic(Config.ClassicMode, "retry") end)
@@ -508,7 +527,6 @@ local function collectAllDiamonds()
             end)
         end
     end
-    -- Ghi nhận lần đầu nhặt kim cương → kích hoạt FirstDiamondGrace
     if n > 0 and FirstDiamondAt == 0 then
         FirstDiamondAt = os.clock()
     end
@@ -597,7 +615,9 @@ local function autoJoinOrCreate()
                 x, y = tonumber(x), tonumber(y)
                 if x and y and x >= 2 and x < y then
                     local enter = obj:FindFirstChildWhichIsA("BasePart")
-                    if enter and HRP() then tpCFrame(enter.CFrame + Vector3.new(0, 3, 0)); joined = true; break end
+                    if enter and HRP() then
+                        tpCFrame(enter.CFrame + Vector3.new(0, 3, 0)); joined = true; break
+                    end
                 end
             end
         end
@@ -714,7 +734,10 @@ task.spawn(function()
             -- 2) Chest thường (KHÔNG mở được -> Hop ngay)
             local chest = findUsableChest()
             if not chest then
-                Hop("Low")
+                -- Chỉ hop nếu không bị khoá, không đang teleport và đã qua grace
+                if not isTeleporting and not HopLock and not inJoinGrace() and not inFirstDiamondGrace() then
+                    Hop("manual") -- truyền đúng reason
+                end
             else
                 local id   = chest:GetDebugId()
                 local prox = chest:FindFirstChildWhichIsA("ProximityPrompt", true)
